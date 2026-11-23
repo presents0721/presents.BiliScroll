@@ -6,6 +6,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Alife.Function.Auditory;
 using Microsoft.Extensions.Logging;
 
 namespace presents.BiliScroll;
@@ -22,8 +23,11 @@ public sealed class TranscribeCapability
     public string PythonPath { get; init; } = "";
     public string Note { get; init; } = "";
 
-    /// <summary>能转写（至少要探测到一种 whisper 后端）。</summary>
-    public bool Ready => WhisperFound;
+    /// <summary>框架 SenseVoice 可用（仍需 ffmpeg 解码音频）。</summary>
+    public bool SenseVoiceFound { get; init; }
+
+    /// <summary>能转写（whisper 后端，或 框架 SenseVoice + ffmpeg）。</summary>
+    public bool Ready => WhisperFound || (SenseVoiceFound && FfmpegFound);
 }
 
 /// <summary>
@@ -35,16 +39,24 @@ public sealed class Transcriber
     readonly ILogger logger;
     readonly Func<BiliScrollConfig> getConfig;
     readonly string pluginDir;
+    readonly IAudioRecognizerProvider? recognizer;   // 框架 SenseVoice（为空时走 whisper.cpp）
 
     TranscribeCapability? cached;
     DateTime cachedAt = DateTime.MinValue;
 
-    public Transcriber(ILogger logger, Func<BiliScrollConfig> getConfig, string pluginDir)
+    public Transcriber(ILogger logger, Func<BiliScrollConfig> getConfig, string pluginDir, IAudioRecognizerProvider? recognizer = null)
     {
         this.logger = logger;
         this.getConfig = getConfig;
         this.pluginDir = pluginDir;
+        this.recognizer = recognizer;
+
+        // 繁→简映射表（whisper 各后端对中文都常输出繁体；表随插件目录分发，缺失时优雅降级）
+        try { TextZh.LoadFromFile(Path.Combine(pluginDir, "textzh.tsv")); } catch { }
     }
+
+    /// <summary>实际使用的转写引擎（给提示词/日志用，别再一律写 whisper）。</summary>
+    public string EngineLabel => recognizer != null ? "SenseVoice（失败时 whisper 兜底）" : "whisper";
 
     // ---------------- 能力探测（带缓存，避免每次调用都起进程）----------------
 
@@ -65,7 +77,8 @@ public sealed class Transcriber
             WhisperPath = whisperPath,
             Backend = backend,
             PythonPath = python,
-            Note = note
+            Note = note,
+            SenseVoiceFound = recognizer != null
         };
         cached = cap;
         cachedAt = DateTime.Now;
@@ -236,8 +249,19 @@ public sealed class Transcriber
 
         try
         {
+            bool senseTried = false;
+
+            // 1) 框架 SenseVoice 优先（需要 ffmpeg 转出的 16k wav）
+            if (recognizer != null && audio.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
+            {
+                senseTried = true;
+                string? sv = await RunSenseVoiceAsync(audio, ct).ConfigureAwait(false);
+                if (sv != null) return CleanTranscript(sv);
+            }
+
+            // 2) whisper 后端兜底
             if (cap.Backend == "whisper.cpp")
-                return await RunWhisperCppAsync(cap.WhisperPath, model, audio, ct);
+                return await RunWhisperCppAsync(cap.WhisperPath, model, audio, ct, senseTried);
             if (cap.Backend == "faster-whisper")
                 return await RunFasterWhisperAsync(cap.PythonPath, model, audio, ct);
             return "";
@@ -249,13 +273,14 @@ public sealed class Transcriber
         }
     }
 
-    async Task<string> RunWhisperCppAsync(string exe, string model, string wav, CancellationToken ct)
+    async Task<string> RunWhisperCppAsync(string exe, string model, string wav, CancellationToken ct, bool senseVoiceTried = false)
     {
         if (!wav.EndsWith(".wav", StringComparison.OrdinalIgnoreCase))
         {
             logger.LogWarning("whisper.cpp 需要 16kHz wav，但 ffmpeg 不可用，跳过本地转写。");
             return "";
         }
+
         string modelPath = ResolveWhisperCppModel(exe, model);
         if (string.IsNullOrEmpty(modelPath))
         {
@@ -264,8 +289,23 @@ public sealed class Transcriber
         }
 
         string outBase = Path.Combine(Path.GetTempPath(), "biliscroll_asr_" + Guid.NewGuid().ToString("N"));
+
+        // VAD（Silero 人声检测）：PPT+BGM 类视频没有语音，不开的话 whisper 会把音乐
+        // 编成「字幕:xx」「(upbeat music)」这类假台词，混进整片转写文本里污染总结。
+        // 模型 0.8 MB，找不到时退回原行为（文本过滤兜底）。
+        string vadArgs = "";
+        // senseVoiceTried=true 说明是"SenseVoice 未出结果"的兜底（典型是歌曲/强 BGM），
+        // 此时 whisper 不能开 VAD——Silero 会把人声当非语音滤掉。
+        if (getConfig().TranscribeVad && !senseVoiceTried)
+        {
+            string? vad = ResolveVadModel(exe);
+
+            if (vad != null)
+                vadArgs = $" --vad -vm \"{vad}\"";
+        }
+
         var (ok, _) = await RunProcessAsync(exe,
-            $"-m \"{modelPath}\" -f \"{wav}\" -l zh -otxt -of \"{outBase}\" -t 4", ct, TimeSpan.FromMinutes(30));
+            $"-m \"{modelPath}\" -f \"{wav}\" -l zh -otxt -of \"{outBase}\" -t 4{vadArgs}", ct, TimeSpan.FromMinutes(30));
 
         string txt = outBase + ".txt";
         string result = "";
@@ -282,6 +322,152 @@ public sealed class Transcriber
         if (!ok && string.IsNullOrWhiteSpace(result))
             logger.LogWarning("whisper.cpp 转写未产出结果。");
         return CleanTranscript(result);
+    }
+
+    /// <summary>
+    /// SenseVoice（框架本地识别器）整片转写：ffmpeg 把 wav 解成 16k f32le PCM，
+    /// 分块喂给 IAudioRecognizer（内置 VAD，纯 BGM 不出词）。
+    /// 返回 null = 不可用（调用方回退 whisper.cpp）；返回 "" = 音频里没人声。
+    /// </summary>
+    async Task<string?> RunSenseVoiceAsync(string wav, CancellationToken ct)
+    {
+        IAudioRecognizerProvider? provider = recognizer;
+        if (provider == null) return null;
+
+        string ffmpeg = ResolveFfmpeg(getConfig());
+        if (string.IsNullOrEmpty(ffmpeg)) return null;
+
+        byte[] pcm;
+        try
+        {
+            pcm = await DecodeF32Async(ffmpeg, wav, ct).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning($"SenseVoice 解码失败，回退 whisper：{e.Message}");
+            return null;
+        }
+
+        if (pcm.Length < 1600) return "";   // < 50ms：空音频
+
+        float[] samples = new float[pcm.Length / 4];
+        Buffer.BlockCopy(pcm, 0, samples, 0, samples.Length * 4);
+
+        var texts = new List<string>();
+        try
+        {
+            using IAudioRecognizer rec = provider.CreateAudioRecognizer();
+            rec.Recognized += t =>
+            {
+                string line = (t ?? "").Trim();
+                if (line.Length > 0) texts.Add(line);
+            };
+
+            // 30 秒超时：识别器在个别音频上可能空转不返回，超时按"不可用"处理（回退 whisper）
+            await Task.Run(() =>
+            {
+                const int step = 3200;   // 200ms
+                for (int i = 0; i < samples.Length; i += step)
+                {
+                    int n = Math.Min(step, samples.Length - i);
+                    rec.AcceptWaveform(samples[i..(i + n)], n);
+                    ct.ThrowIfCancellationRequested();
+                }
+
+                rec.Flush();
+            }, ct).WaitAsync(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
+
+            // VAD 空输出但音频有能量（歌曲/强 BGM）→ 回退 whisper
+            float peak = 0f;
+            for (int i = 0; i < samples.Length; i += 16)
+            {
+                float a = Math.Abs(samples[i]);
+                if (a > peak) peak = a;
+            }
+            if (texts.Count == 0 && peak > 0.02f && getConfig().TranscribeMusicFallback) return null;
+        }
+        catch (Exception e)
+        {
+            logger.LogWarning($"SenseVoice 识别失败，回退 whisper：{e.Message}");
+            return null;
+        }
+
+        return string.Join("。", texts);
+    }
+
+    /// <summary>ffmpeg → 16k 单声道 f32le 原始字节（-nostdin 防挂死）。</summary>
+    static async Task<byte[]> DecodeF32Async(string ffmpeg, string file, CancellationToken ct)
+    {
+        var psi = new System.Diagnostics.ProcessStartInfo(ffmpeg)
+        {
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (string a in new[] { "-hide_banner", "-nostdin", "-loglevel", "error", "-i", file, "-f", "f32le", "-ar", "16000", "-ac", "1", "-" })
+            psi.ArgumentList.Add(a);
+
+        using var p = System.Diagnostics.Process.Start(psi)!;
+        try { p.StandardInput.Close(); } catch { }
+        using var ms = new MemoryStream();
+        await p.StandardOutput.BaseStream.CopyToAsync(ms, ct).ConfigureAwait(false);
+        string err = await p.StandardError.ReadToEndAsync(ct).ConfigureAwait(false);
+        await p.WaitForExitAsync(ct).ConfigureAwait(false);
+        if (p.ExitCode != 0)
+            throw new InvalidOperationException($"ffmpeg 退出 {p.ExitCode}：{err[..Math.Min(120, err.Length)]}");
+        return ms.ToArray();
+    }
+
+    /// <summary>
+    /// 找 Silero VAD 模型：whisper.exe 同目录 / models\ 子目录 / 插件 tools\whisper。
+    /// 跳过下载失败的 HTML 垃圾（&lt;100KB），纯 silero* 优先于 for-tests-*。
+    /// </summary>
+    string? ResolveVadModel(string exe)
+    {
+        var dirs = new List<string>();
+        try
+        {
+            string? d = Path.GetDirectoryName(exe);
+            if (!string.IsNullOrEmpty(d))
+            {
+                dirs.Add(d);
+                dirs.Add(Path.Combine(d, "models"));
+            }
+        }
+        catch
+        {
+        }
+        dirs.Add(Path.Combine(pluginDir, "tools", "whisper"));
+        dirs.Add(Path.Combine(pluginDir, "tools", "whisper", "models"));
+
+        foreach (string d in dirs)
+        {
+            if (!Directory.Exists(d)) continue;
+
+            try
+            {
+                string? hit = Directory.GetFiles(d, "*.bin")
+                    .Concat(Directory.GetFiles(d, "*.ggml"))
+                    .Where(f => new FileInfo(f).Length > 100 * 1024)
+                    .OrderByDescending(f => Path.GetFileName(f).ToLowerInvariant().Contains("silero"))
+                    .ThenBy(f => Path.GetFileName(f).ToLowerInvariant().Contains("for-tests"))
+                    .FirstOrDefault(f =>
+                    {
+                        string name = Path.GetFileName(f).ToLowerInvariant();
+                        return name.Contains("silero") || name.Contains("vad");
+                    });
+
+                if (hit != null) return hit;
+            }
+            catch
+            {
+                // 目录读不了就跳过
+            }
+        }
+
+        return null;
     }
 
     string ResolveWhisperCppModel(string exe, string model)
@@ -438,7 +624,7 @@ public sealed class Transcriber
         }
     }
 
-    /// <summary>清掉转写结果里的空白行与 BOM，保留正文。</summary>
+    /// <summary>清掉转写结果里的空白行与 BOM、丢掉 BGM 幻觉行，并把繁体输出转成简体。</summary>
     static string CleanTranscript(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -447,8 +633,48 @@ public sealed class Transcriber
             .Replace("\uFEFF", "")
             .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
             .Select(l => l.Trim())
-            .Where(l => l.Length > 0);
+            .Where(l => l.Length > 0 && !LooksLikeHallucination(l))
+            .Select(TextZh.MaybeSimplify);
         return string.Join("\n", lines);
+    }
+
+    /// <summary>
+    /// whisper 在纯音乐上常编的行：字幕组署名、(upbeat music) 这类场景标注、
+    /// 订阅/点赞套话、重复拟声。混进总结里模型就会照着念——宁可丢掉。
+    /// </summary>
+    static bool LooksLikeHallucination(string line)
+    {
+        string t = (line ?? "").Trim();
+        if (t.Length == 0) return false;
+
+        // 场景标注式幻觉：(upbeat music) / [Applause]
+        if (t.StartsWith("(") && t.EndsWith(")")) return true;
+        if (t.StartsWith("[") && t.EndsWith("]")) return true;
+
+        string cleaned = t.Replace("♪", "").Replace("♫", "").Replace("♬", "").Trim();
+        if (cleaned.Length < 2) return true;
+
+        int useful = cleaned.Count(char.IsLetterOrDigit);
+        if (useful < 2) return true;
+        if (useful * 100 / Math.Max(1, cleaned.Length) < 55) return true;
+
+        // 高度重复（「啊啊啊啊」）
+        if (cleaned.Length >= 6 && cleaned.Distinct().Count() <= 3) return true;
+
+        string lower = cleaned.ToLowerInvariant();
+        string[] alwaysJunk = { "字幕组", "字幕由", "字幕提供", "字幕:", "字幕：", "amara", "subscribe", "请订阅", "点赞", "打赏", "关注我" };
+        foreach (string junk in alwaysJunk)
+        {
+            if (lower.Contains(junk, StringComparison.Ordinal) && cleaned.Length <= 30) return true;
+        }
+
+        string[] shortJunk = { "谢谢观看", "谢谢大家", "感谢观看", "谢谢收看", "music", "音乐", "掌声", "applause" };
+        foreach (string junk in shortJunk)
+        {
+            if (lower.Contains(junk, StringComparison.Ordinal) && cleaned.Length <= 30) return true;
+        }
+
+        return false;
     }
 
     /// <summary>
