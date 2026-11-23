@@ -105,6 +105,22 @@ public class BiliScrollConfig
     [Description("只有字幕/转写文字少于这个字数时才抽帧识图（省 token）。默认 600；填 0 = 总是识图。")]
     public int VisionTextThreshold { get; set; } = 600;
 
+    [DisplayName("关键帧 OCR")]
+    [Description("默认关。开：用 Windows 自带 OCR 读关键帧上的文字（PPT/公式/代码原文）。没有视觉模型时也能拿到这页内容；有模型时作为兜底。零依赖、不出网。")]
+    public bool FrameOcr { get; set; } = false;
+
+    [DisplayName("有视觉模型时也附 OCR")]
+    [Description("默认关：只在没模型或视觉失败时才 OCR。开：每帧都附画面原文（要精确引用代码/公式时开，会多花一点时间）。")]
+    public bool OcrAlways { get; set; } = false;
+
+    [DisplayName("OCR 语言")]
+    [Description("默认 zh-Hans；英文视频用 en-US。")]
+    public string OcrLanguage { get; set; } = "zh-Hans";
+
+    [DisplayName("OCR 字数上限")]
+    [Description("单帧最多给多少字，默认 400。")]
+    public int OcrMaxChars { get; set; } = 400;
+
     [DisplayName("识图前先看全片概览")]
     [Description("默认开。只把「画面真正变化过」的关键帧拼成网格图，让视觉模型一次看清整条视频的结构（讲什么、怎么分段），再逐帧看细节——先有骨架，再补细节。格数多时会自动切成多张（最多 4 张）。关掉则回到「只有逐帧描述」。")]
     public bool FrameOverview { get; set; } = true;
@@ -273,23 +289,31 @@ public class BiliScrollConfig
     // ---------------- 本地转写（可选。装了就自动用，没装就优雅跳过，零 Python 强制依赖）----------------
 
     [DisplayName("本地转写（无字幕时）")]
-    [Description("默认关。打开后遇到没有字幕的视频，会用本机的 ffmpeg + whisper 把音频转成文字再判断。没装 ffmpeg/whisper 时自动跳过，不影响其它功能。")]
+    [Description("默认关。打开后遇到没有字幕的视频，会用本机 ffmpeg 抽出音频，优先交给框架 SenseVoice 转写（不可用时回退 whisper）。没装 ffmpeg/转写引擎时自动跳过，不影响其它功能。")]
     public bool LocalTranscribe { get; set; } = false;
 
     [DisplayName("转写后端")]
-    [Description("自动 / whisper.cpp / faster-whisper。自动 = 谁先探测到就用谁。")]
+    [Description("自动 / whisper.cpp / faster-whisper。框架 SenseVoice 可用时总是优先；这里只决定 whisper 兜底走哪个后端（自动 = 谁先探测到就用谁）。")]
     public string TranscribeBackend { get; set; } = "自动";
 
     [DisplayName("转写模型")]
     [Description("tiny / base / small。越大越准也越慢，tiny 够用。")]
     public string TranscribeModel { get; set; } = "tiny";
 
+    [DisplayName("转写 VAD 人声检测")]
+    [Description("开（默认）：whisper 兜底转写前先用 Silero VAD 把纯音乐/静音切掉。PPT+BGM 类视频没有语音，不开的话 whisper 会把 BGM 编成「字幕:xx」「(upbeat music)」这类假台词混进总结。SenseVoice 自带 VAD，不受这里影响。模型自动找 whisper 同目录 models\\ 下带 silero/vad 的文件（0.8 MB）。")]
+    public bool TranscribeVad { get; set; } = true;
+
+    [DisplayName("歌曲/音乐兜底")]
+    [Description("开（默认）：SenseVoice 滤空但音频有能量时，回退 whisper（关 VAD）整片转写歌词——音乐区视频靠它。纯 BGM 的汇报/课件视频建议关，避免把伴奏编成歌词。")]
+    public bool TranscribeMusicFallback { get; set; } = true;
+
     [DisplayName("ffmpeg 路径")]
     [Description("留空则在 PATH 与常见位置自动查找。")]
     public string FfmpegPath { get; set; } = "";
 
-    [DisplayName("whisper 路径")]
-    [Description("留空则自动查找 whisper-cli/whisper 及 faster-whisper。指向 exe 用 whisper.cpp，留空或指向 python 用 faster-whisper。")]
+    [DisplayName("whisper 路径（兜底）")]
+    [Description("只有 SenseVoice 不可用（或音乐兜底）时才用。留空则自动查找 whisper-cli/whisper 及 faster-whisper。指向 exe 用 whisper.cpp，留空或指向 python 用 faster-whisper。")]
     public string WhisperPath { get; set; } = "";
 
     [DisplayName("单条转写最长的音频分钟数")]
